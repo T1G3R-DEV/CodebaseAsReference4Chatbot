@@ -1,0 +1,9 @@
+[package]
+name = "CodebaseAsReference4Chatbot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clipboard-rs = "0.2.4"
+ignore = "0.4.23"
