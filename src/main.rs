@@ -1,17 +1,18 @@
 use clap::Parser;
 use clipboard_rs::{Clipboard, ClipboardContext};
 use ignore::WalkBuilder;
+use serde::Serialize;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-/// Recursively list files and copy to clipboard, including content of non-binary files.
+/// Recursively list files and copy to clipboard, optionally with contents.
 #[derive(Parser, Debug)]
 #[command(name = "listclip")]
 #[command(author = "You <you@example.com>")]
-#[command(version = "1.2")]
+#[command(version = "1.5")]
 #[command(about = "List files and copy to clipboard", long_about = None)]
 struct Args {
     /// Starting directory (default: current dir)
@@ -29,14 +30,43 @@ struct Args {
     /// Do not respect .gitignore rules
     #[arg(long)]
     no_gitignore: bool,
+
+    /// Filter by file extensions (e.g. --ext rs --ext toml)
+    #[arg(short, long, value_name = "EXT")]
+    ext: Vec<String>,
+
+    /// Disable content inclusion, list files only
+    #[arg(long)]
+    no_content: bool,
+
+    /// Output as JSON
+    #[arg(long)]
+    json: bool,
 }
 
-/// Check if a file is binary by inspecting first few KB for null bytes
+#[derive(Serialize)]
+struct FileEntry {
+    path: String,
+    content: Option<String>,
+}
+
+/// Check if a file is binary by inspecting the first chunk for null bytes
 fn is_binary_file(path: &PathBuf) -> io::Result<bool> {
     let mut file = File::open(path)?;
     let mut buffer = [0; 1024];
     let bytes_read = file.read(&mut buffer)?;
     Ok(buffer[..bytes_read].contains(&0))
+}
+
+/// Return true if file matches extension filters (or if no filters given)
+fn matches_extension(path: &Path, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext_str| filters.iter().any(|f| f == ext_str))
+        .unwrap_or(false)
 }
 
 fn collect_file_data(args: &Args) -> io::Result<String> {
@@ -47,7 +77,9 @@ fn collect_file_data(args: &Args) -> io::Result<String> {
         builder.git_ignore(false).git_exclude(false).ignore(false);
     }
 
-    let mut output = String::new();
+    let mut entries: Vec<FileEntry> = Vec::new();
+    let mut list_section = String::from("=== File & Directory List ===\n");
+    let mut content_section = String::new();
     let mut count = 0;
 
     for result in builder.build() {
@@ -57,49 +89,68 @@ fn collect_file_data(args: &Args) -> io::Result<String> {
         };
 
         let path = entry.path().to_path_buf();
-        if !path.is_file() {
-            continue;
-        }
+        let display_path = path.display().to_string();
+        list_section.push_str(&format!("{}\n", display_path));
 
-        count += 1;
-        if args.verbose {
-            println!("Reading: {}", path.display());
-        }
+        if path.is_file() && matches_extension(&path, &args.ext) {
+            count += 1;
+            if args.verbose {
+                println!("Reading: {}", display_path);
+            }
 
-        if let Ok(false) = is_binary_file(&path) {
-            output.push_str(&format!("=== {} ===\n", path.display()));
-            match fs::read_to_string(&path) {
-                Ok(contents) => output.push_str(&format!("{}\n\n", contents)),
-                Err(err) => output.push_str(&format!("(Could not read file: {})\n\n", err)),
+            let content = if args.no_content {
+                None
+            } else if let Ok(false) = is_binary_file(&path) {
+                match fs::read_to_string(&path) {
+                    Ok(c) => Some(c),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            entries.push(FileEntry {
+                path: display_path.clone(),
+                content: content.clone(),
+            });
+
+            if !args.json && content.is_some() {
+                content_section.push_str(&format!("\n=== {} ===\n{}\n", display_path, content.unwrap()));
             }
         } else {
-            output.push_str(&format!("=== {} ===\n(Binary file skipped)\n\n", path.display()));
+            entries.push(FileEntry {
+                path: display_path.clone(),
+                content: None,
+            });
         }
     }
 
-    if !args.verbose {
-        println!("Copied {} file paths (and contents) to clipboard.", count);
+    if args.json {
+        Ok(serde_json::to_string_pretty(&entries).unwrap())
+    } else {
+        Ok(format!("{}\n{}", list_section, content_section))
     }
-
-    Ok(output)
 }
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
+    let output = collect_file_data(&args)?;
 
-    let full_output = collect_file_data(&args)?;
-
-    // Copy to clipboard
     let mut ctx = ClipboardContext::new().unwrap();
-    ctx.set_text(full_output.clone()).unwrap();
+    ctx.set_text(output.clone()).unwrap();
 
-    // Save to file if needed
-    if let Some(path) = args.out.as_ref() {
+    if let Some(path) = &args.out {
         let mut file = File::create(path)?;
-        file.write_all(full_output.as_bytes())?;
+        file.write_all(output.as_bytes())?;
     }
 
-    thread::sleep(Duration::from_secs(2)); // For X11 clipboard hold
+    
+    println!(
+        "Copied file list{} to clipboard.",
+        if args.no_content { "" } else { " with content" }
+    );
+
+
+    thread::sleep(Duration::from_secs(2));
     Ok(())
 }
-
